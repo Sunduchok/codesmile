@@ -1,79 +1,84 @@
 import ca.uhn.fhir.context.FhirContext;
+import ca.uhn.fhir.rest.api.CacheControlDirective;
 import ca.uhn.fhir.rest.client.api.IGenericClient;
-import ca.uhn.fhir.rest.client.interceptor.LoggingInterceptor;
+import ca.uhn.fhir.rest.client.api.ServerValidationModeEnum;
+import ca.uhn.fhir.rest.gclient.IQuery;
 import org.hl7.fhir.r4.model.Bundle;
-import org.hl7.fhir.r4.model.HumanName;
 import org.hl7.fhir.r4.model.Patient;
 
-import java.util.Comparator;
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.util.List;
+import java.util.stream.Collectors;
 
 public class SampleClient {
 
-    public static void main(String[] theArgs) {
+    private static final String BASE_URL = "http://hapi.fhir.org/baseR4";
 
-        // Create a FHIR client
-        FhirContext fhirContext = FhirContext.forR4();
-        IGenericClient client = fhirContext.newRestfulGenericClient("http://hapi.fhir.org/baseR4");
-        client.registerInterceptor(new LoggingInterceptor(false));
+    public static void main(String[] args) {
+        try {
+            FhirContext fhirContext = FhirContext.forR4();
+            List<String> names = readNames("names.txt");
 
-        // Search for Patient resources
-        Bundle response = client
-                .search()
-                .forResource("Patient")
-                .where(Patient.FAMILY.matches().value("SMITH"))
-                .returnBundle(Bundle.class)
-                .execute();
+            // First run: cache allowed
+            searchNamesAndPrintAvgTime(fhirContext, names, false);
+            // Second run: cache allowed
+            searchNamesAndPrintAvgTime(fhirContext, names, false);
+            // Third run: cache disabled
+            searchNamesAndPrintAvgTime(fhirContext, names, true);
 
-        // Sort the response by patience's first name since the order is not guarantied
-        sortBundleEntriesByFirstName(response);
-        // Process the response for printing names and DOBs
-        printPatientsNameAndDOB(response);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
     }
 
-    public static void sortBundleEntriesByFirstName(Bundle bundle) {
-        if (bundle == null || bundle.getEntry() == null || bundle.getEntry().isEmpty()) {
-            return;
+    public static double searchNamesAndPrintAvgTime(FhirContext fhirContext, List<String> names, boolean noCache) {
+        if (names == null || names.isEmpty()) {
+            System.out.println("No names provided for search.");
+            return 0;
+        }
+        //TODO: it needs investigation, configuration changes seems do not have a visible impact on the average time
+        if(noCache) {
+            fhirContext.getValidationSupport().invalidateCaches();
+            fhirContext.getRestfulClientFactory().setServerValidationMode(ServerValidationModeEnum.NEVER);
         }
 
-        List<Bundle.BundleEntryComponent> entries = bundle.getEntry();
+        IGenericClient client = fhirContext.newRestfulGenericClient(BASE_URL);
+        AverageSearchTimeInterceptor avgInterceptor = new AverageSearchTimeInterceptor();
+        client.registerInterceptor(avgInterceptor);
 
-        // Sort the entries using a custom Comparator
-        entries.sort(new Comparator<Bundle.BundleEntryComponent>() {
-            @Override
-            public int compare(Bundle.BundleEntryComponent entryFirst, Bundle.BundleEntryComponent entrySecond) {
+        names.forEach(name -> executeSearch(client, name, noCache));
 
-                Patient patientFirst = (Patient) entryFirst.getResource();
-                Patient patientSecond = (Patient) entrySecond.getResource();
-
-                if (patientFirst == null && patientSecond == null) {
-                    return 0;
-                } else if (patientFirst == null) {
-                    return 1;
-                } else if (patientSecond == null) {
-                    return -1;
-                }
-
-                String nameFirst = patientFirst.getNameFirstRep().getGivenAsSingleString();
-                String nameSecond = patientSecond.getNameFirstRep().getGivenAsSingleString();
-
-                return nameFirst.compareTo(nameSecond);
-            }
-        });
+        double avgTime = avgInterceptor.getAverageMillis();
+        System.out.println("Average response time" + (noCache ? " (no cache)" : "") + ": " + avgTime + " ms");
+        return avgTime;
     }
 
-    public static void printPatientsNameAndDOB(Bundle bundle) {
-        bundle.getEntry().stream()
-                .map(entry -> (Patient) entry.getResource())
-                .forEach(patient -> {
-                    // the name may consist of multiple names
-                    String name = patient.getName().stream()
-                            .map(HumanName::getNameAsSingleString)
-                            .findFirst()
-                            .orElse("NO NAME");
+    private static void executeSearch(IGenericClient client, String name, boolean noCache) {
+        IQuery<Bundle> search = client.search()
+                .forResource(Patient.class)
+                .where(Patient.FAMILY.matches().value(name.toUpperCase()))
+                .returnBundle(Bundle.class);
 
-                    String dateOfBirth = patient.hasBirthDate() ? patient.getBirthDate().toString() : "UKNOWN";
-                    System.out.println(name + ", " + dateOfBirth);
-                });
+        if (noCache) {
+            search.cacheControl(new CacheControlDirective().setNoCache(true));
+        }
+        search.execute();
+    }
+
+    public static List<String> readNames(String resourceFileName) throws IOException {
+        try (InputStream inputStream = SampleClient.class.getResourceAsStream("/" + resourceFileName)) {
+            if (inputStream == null) {
+                throw new IOException("Resource not found: " + resourceFileName);
+            }
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(inputStream))) {
+                return reader.lines()
+                        .map(String::trim)
+                        .filter(s -> !s.isEmpty())
+                        .collect(Collectors.toList());
+            }
+        }
     }
 }
